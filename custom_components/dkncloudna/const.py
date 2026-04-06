@@ -26,27 +26,24 @@ EVENT_CONTROL_NEW_DEVICE = "control-new-device"
 EVENT_CONTROL_DELETED_DEVICE = "control-deleted-device"
 EVENT_CONTROL_DELETED_INSTALLATION = "control-deleted-installation"
 
-# Device modes
-MODE_AUTO = 4
-MODE_COOL = 1
-MODE_HEAT = 2
-MODE_FAN = 3
-MODE_DRY = 5
+# Device mode values (as reported by the DKN API)
+# Actual behavior based on real hardware testing:
+MODE_HEAT_COOL = 1  # Auto heat/cool
+MODE_COOL = 2       # Cooling
+MODE_HEAT = 3       # Heating
+MODE_FAN = 4        # Fan only
+MODE_DRY = 5        # Dry
 
 # Fan speed states
 SPEED_AUTO = 0
 SPEED_LOW = 2
-SPEED_MED_LOW = 3
 SPEED_MED = 4
-SPEED_MED_HIGH = 5
 SPEED_HIGH = 6
 
 FAN_SPEED_MAP = {
     SPEED_AUTO: "auto",
     SPEED_LOW: "low",
-    SPEED_MED_LOW: "medium_low",
     SPEED_MED: "medium",
-    SPEED_MED_HIGH: "medium_high",
     SPEED_HIGH: "high",
 }
 
@@ -57,12 +54,10 @@ PROP_POWER = "power"
 PROP_MODE = "mode"
 PROP_REAL_MODE = "real_mode"
 PROP_WORK_TEMP = "work_temp"
-PROP_EXT_TEMP = "ext_temp"
 PROP_SETPOINT_AUTO = "setpoint_air_auto"
 PROP_SETPOINT_COOL = "setpoint_air_cool"
 PROP_SETPOINT_HEAT = "setpoint_air_heat"
 PROP_SPEED_STATE = "speed_state"
-PROP_SLATS_VERTICAL = "slats_vertical_1"
 
 # Temperature units from device
 UNITS_CELSIUS = 0

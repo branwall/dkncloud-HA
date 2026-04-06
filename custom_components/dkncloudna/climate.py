@@ -21,18 +21,17 @@ from .const import (
     DOMAIN,
     FAN_SPEED_MAP,
     FAN_SPEED_REVERSE_MAP,
-    MODE_AUTO,
     MODE_COOL,
     MODE_DRY,
     MODE_FAN,
     MODE_HEAT,
+    MODE_HEAT_COOL,
     PROP_MODE,
     PROP_POWER,
     PROP_REAL_MODE,
     PROP_SETPOINT_AUTO,
     PROP_SETPOINT_COOL,
     PROP_SETPOINT_HEAT,
-    PROP_SLATS_VERTICAL,
     PROP_SPEED_STATE,
     PROP_WORK_TEMP,
     SPEED_AUTO,
@@ -40,8 +39,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Map device mode values to HA HVAC modes
 HVAC_MODE_MAP = {
-    MODE_AUTO: HVACMode.HEAT_COOL,
+    MODE_HEAT_COOL: HVACMode.HEAT_COOL,
     MODE_COOL: HVACMode.COOL,
     MODE_HEAT: HVACMode.HEAT,
     MODE_FAN: HVACMode.FAN_ONLY,
@@ -51,7 +51,7 @@ HVAC_MODE_MAP = {
 HVAC_MODE_REVERSE_MAP = {v: k for k, v in HVAC_MODE_MAP.items()}
 
 SETPOINT_PROP_MAP = {
-    MODE_AUTO: PROP_SETPOINT_AUTO,
+    MODE_HEAT_COOL: PROP_SETPOINT_AUTO,
     MODE_COOL: PROP_SETPOINT_COOL,
     MODE_HEAT: PROP_SETPOINT_HEAT,
 }
@@ -61,7 +61,7 @@ HVAC_ACTION_MAP = {
     MODE_HEAT: HVACAction.HEATING,
     MODE_FAN: HVACAction.FAN,
     MODE_DRY: HVACAction.DRYING,
-    MODE_AUTO: HVACAction.IDLE,
+    MODE_HEAT_COOL: HVACAction.IDLE,
 }
 
 
@@ -100,11 +100,9 @@ class DknClimateEntity(ClimateEntity):
         HVACMode.DRY,
     ]
     _attr_fan_modes = list(FAN_SPEED_MAP.values())
-    _attr_swing_modes = ["on", "off"]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.FAN_MODE
-        | ClimateEntityFeature.SWING_MODE
         | ClimateEntityFeature.TURN_ON
         | ClimateEntityFeature.TURN_OFF
     )
@@ -158,12 +156,6 @@ class DknClimateEntity(ClimateEntity):
     def current_temperature(self) -> float | None:
         """Return the current temperature."""
         temp = self._data.get(PROP_WORK_TEMP)
-        _LOGGER.debug(
-            "Device %s current_temperature: work_temp=%s, all keys=%s",
-            self._mac,
-            temp,
-            list(self._data.keys()),
-        )
         if temp is not None:
             return self._to_celsius(temp)
         return None
@@ -174,13 +166,6 @@ class DknClimateEntity(ClimateEntity):
         mode = self._data.get(PROP_MODE)
         prop = SETPOINT_PROP_MAP.get(mode, PROP_SETPOINT_AUTO)
         temp = self._data.get(prop)
-        _LOGGER.debug(
-            "Device %s target_temperature: mode=%s, prop=%s, temp=%s",
-            self._mac,
-            mode,
-            prop,
-            temp,
-        )
         if temp is not None:
             return self._to_celsius(temp)
         return None
@@ -192,15 +177,8 @@ class DknClimateEntity(ClimateEntity):
         return FAN_SPEED_MAP.get(speed_state, "auto")
 
     @property
-    def swing_mode(self) -> str | None:
-        """Return the current swing mode."""
-        slats = self._data.get(PROP_SLATS_VERTICAL, 0)
-        return "on" if slats == 9 else "off"
-
-    @property
     def _units(self) -> int:
         """Return the temperature unit setting (0=Celsius, 1=Fahrenheit)."""
-        # Units come from the installation level, stored on the device_info
         return self._device_info.get("units", 0)
 
     def _to_celsius(self, value: float) -> float:
@@ -245,11 +223,6 @@ class DknClimateEntity(ClimateEntity):
         """Set new fan mode."""
         speed_state = FAN_SPEED_REVERSE_MAP.get(fan_mode, SPEED_AUTO)
         await self._api.send_command(self._mac, PROP_SPEED_STATE, speed_state)
-
-    async def async_set_swing_mode(self, swing_mode: str) -> None:
-        """Set new swing mode."""
-        value = 9 if swing_mode == "on" else 0
-        await self._api.send_command(self._mac, PROP_SLATS_VERTICAL, value)
 
     async def async_turn_on(self) -> None:
         """Turn the entity on."""
