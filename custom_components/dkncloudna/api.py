@@ -618,20 +618,40 @@ class DknCloudApi:
     def _on_install_disconnect(self, data: Any) -> None:
         _LOGGER.warning("Installation namespace disconnected")
 
-    def _on_device_data(self, data: Any) -> None:
-        """Handle incoming device data from socket.io."""
-        if not isinstance(data, dict):
-            _LOGGER.debug("Unexpected device-data format: %s", data)
+    def _on_device_data(self, message: Any) -> None:
+        """Handle incoming device data from socket.io.
+
+        The message format is: {"mac": "...", "data": {...device properties...}}
+        or it may be flat: {"mac": "...", "work_temp": 72, ...}
+        """
+        if not isinstance(message, dict):
+            _LOGGER.debug("Unexpected device-data format: %s", message)
             return
 
-        mac = data.get("mac")
+        mac = message.get("mac")
+        # The Homebridge plugin receives {mac, data} where data contains
+        # the actual device properties
+        device_data = message.get("data", message)
+
+        _LOGGER.debug(
+            "Device data event: mac=%s, keys=%s, raw=%s",
+            mac,
+            list(device_data.keys()) if isinstance(device_data, dict) else None,
+            message,
+        )
+
         if mac and mac in self._devices:
             device = self._devices[mac]
-            device["data"].update(data)
-            _LOGGER.debug("Device data update for %s: %s", mac, data)
+            if isinstance(device_data, dict):
+                device["data"].update(device_data)
+            _LOGGER.debug(
+                "Device %s updated state keys: %s",
+                mac,
+                list(device["data"].keys()),
+            )
             self._notify_device_update(mac)
         else:
-            _LOGGER.debug("Device data for unknown mac %s: %s", mac, data)
+            _LOGGER.debug("Device data for unknown mac %s", mac)
 
     async def send_command(
         self, mac: str, prop: str, value: Any

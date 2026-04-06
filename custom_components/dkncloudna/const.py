@@ -11,7 +11,7 @@ API_LOGIN_PATH = "/auth/login/dknUsa"
 API_LOGGED_IN_PATH = "/users/isLoggedIn/dknUsa"
 API_REFRESH_TOKEN_PATH = "/auth/refreshToken/"
 API_INSTALLATIONS_PATH = "/installations/dknUsa"
-API_SOCKET_PATH = "/devices/socket.io/"
+API_SOCKET_PATH = "/api/v1/devices/socket.io/"
 
 USER_AGENT = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 15_5 like Mac OS X) "
