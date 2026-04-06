@@ -197,17 +197,21 @@ class DknClimateEntity(ClimateEntity):
         slats = self._data.get(PROP_SLATS_VERTICAL, 0)
         return "on" if slats == 9 else "off"
 
+    @property
+    def _units(self) -> int:
+        """Return the temperature unit setting (0=Celsius, 1=Fahrenheit)."""
+        # Units come from the installation level, stored on the device_info
+        return self._device_info.get("units", 0)
+
     def _to_celsius(self, value: float) -> float:
         """Convert temperature to Celsius if device reports Fahrenheit."""
-        units = self._data.get("config_temp_unit", 0)
-        if units == 1:  # Fahrenheit
+        if self._units == 1:  # Fahrenheit
             return round(((value - 32) * 5 / 9), 1)
         return value
 
     def _to_device_temp(self, celsius: float) -> float:
         """Convert Celsius to device units if needed."""
-        units = self._data.get("config_temp_unit", 0)
-        if units == 1:  # Fahrenheit
+        if self._units == 1:  # Fahrenheit
             return round((celsius * 9 / 5) + 32)
         return celsius
 

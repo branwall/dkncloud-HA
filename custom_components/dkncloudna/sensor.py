@@ -81,7 +81,8 @@ class DknExteriorTemperatureSensor(SensorEntity):
         temp = self._data.get(PROP_EXT_TEMP)
         if temp is None:
             return None
-        units = self._data.get("config_temp_unit", 0)
+        # Units come from installation level, stored on device_info
+        units = self._device_info.get("units", 0)
         if units == 1:  # Fahrenheit
             return round(((temp - 32) * 5 / 9), 1)
         return temp

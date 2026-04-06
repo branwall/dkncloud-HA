@@ -1,13 +1,18 @@
-"""DKN Cloud NA API client."""
+"""DKN Cloud NA API client.
+
+Implements Socket.IO v2 (Engine.IO v3) protocol directly using aiohttp
+websockets, since the DKN Cloud NA server uses Socket.IO v2 and the
+python-socketio v5 library only speaks Socket.IO v5 (EIO=4).
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Callable
 
 import aiohttp
-import socketio
 
 from .const import (
     API_BASE_PATH,
@@ -17,15 +22,26 @@ from .const import (
     API_LOGIN_PATH,
     API_REFRESH_TOKEN_PATH,
     API_SOCKET_PATH,
-    EVENT_CONTROL_DELETED_DEVICE,
-    EVENT_CONTROL_DELETED_INSTALLATION,
-    EVENT_CONTROL_NEW_DEVICE,
     EVENT_CREATE_MACHINE_EVENT,
     EVENT_DEVICE_DATA,
     USER_AGENT,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Engine.IO v3 packet types
+EIO_OPEN = "0"
+EIO_CLOSE = "1"
+EIO_PING = "2"
+EIO_PONG = "3"
+EIO_MESSAGE = "4"
+
+# Socket.IO v2 packet types (carried inside EIO_MESSAGE)
+SIO_CONNECT = "0"
+SIO_DISCONNECT = "1"
+SIO_EVENT = "2"
+SIO_ACK = "3"
+SIO_ERROR = "4"
 
 
 class DknCloudApiError(Exception):
@@ -40,6 +56,285 @@ class DknConnectionError(DknCloudApiError):
     """Connection error."""
 
 
+class SocketIOv2Connection:
+    """A single Socket.IO v2 connection managing multiple namespaces."""
+
+    def __init__(
+        self,
+        base_url: str,
+        socket_path: str,
+        token: str,
+        session: aiohttp.ClientSession,
+    ) -> None:
+        """Initialize the Socket.IO v2 connection."""
+        self._base_url = base_url
+        self._socket_path = socket_path
+        self._token = token
+        self._session = session
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._event_handlers: dict[str, dict[str, list[Callable]]] = {}
+        self._namespaces: list[str] = []
+        self._connected_namespaces: set[str] = set()
+        self._ping_interval: float = 25.0
+        self._ping_timeout: float = 60.0
+        self._listener_task: asyncio.Task | None = None
+        self._ping_task: asyncio.Task | None = None
+        self._connected = False
+        self._ack_id = 0
+
+    @property
+    def connected(self) -> bool:
+        """Return whether the connection is active."""
+        return self._connected and self._ws is not None and not self._ws.closed
+
+    def on(self, event: str, namespace: str, handler: Callable) -> None:
+        """Register an event handler for a namespace."""
+        if namespace not in self._event_handlers:
+            self._event_handlers[namespace] = {}
+        if event not in self._event_handlers[namespace]:
+            self._event_handlers[namespace][event] = []
+        self._event_handlers[namespace][event].append(handler)
+
+    async def connect(self, namespaces: list[str]) -> None:
+        """Establish the websocket connection and join namespaces."""
+        self._namespaces = namespaces
+
+        # Build the websocket URL with EIO=3 for Socket.IO v2
+        ws_url = (
+            f"{self._base_url.replace('https://', 'wss://').replace('http://', 'ws://')}"
+            f"/{self._socket_path.strip('/')}/"
+            f"?transport=websocket&EIO=3"
+        )
+
+        _LOGGER.debug("Connecting to Socket.IO v2: %s", ws_url)
+
+        try:
+            self._ws = await self._session.ws_connect(
+                ws_url,
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "User-Agent": USER_AGENT,
+                },
+            )
+        except Exception as err:
+            _LOGGER.error("WebSocket connection failed: %s", err)
+            raise DknConnectionError(
+                f"WebSocket connection failed: {err}"
+            ) from err
+
+        # Read the EIO open packet to get ping interval
+        msg = await self._ws.receive(timeout=10)
+        if msg.type == aiohttp.WSMsgType.TEXT and msg.data.startswith(EIO_OPEN):
+            open_data = json.loads(msg.data[1:])
+            self._ping_interval = open_data.get("pingInterval", 25000) / 1000
+            self._ping_timeout = open_data.get("pingTimeout", 60000) / 1000
+            _LOGGER.debug(
+                "EIO open: pingInterval=%.1fs, pingTimeout=%.1fs, sid=%s",
+                self._ping_interval,
+                self._ping_timeout,
+                open_data.get("sid"),
+            )
+        else:
+            _LOGGER.error("Unexpected first message: %s", msg)
+            await self._ws.close()
+            raise DknConnectionError("Did not receive EIO open packet")
+
+        # The default namespace "/" is auto-connected.
+        # Read the SIO connect for "/" namespace
+        msg = await self._ws.receive(timeout=10)
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            _LOGGER.debug("Default namespace connect message: %s", msg.data)
+            self._connected_namespaces.add("/")
+
+        self._connected = True
+
+        # Connect to additional namespaces
+        for ns in namespaces:
+            if ns != "/":
+                # Socket.IO v2: send "40/namespace," to connect
+                connect_msg = f"{EIO_MESSAGE}{SIO_CONNECT}{ns},"
+                _LOGGER.debug("Joining namespace: %s", ns)
+                await self._ws.send_str(connect_msg)
+
+        # Start background tasks
+        self._listener_task = asyncio.create_task(self._listen())
+        self._ping_task = asyncio.create_task(self._ping_loop())
+
+    async def _listen(self) -> None:
+        """Listen for incoming messages."""
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    await self._handle_message(msg.data)
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    _LOGGER.error("WebSocket error: %s", self._ws.exception())
+                    break
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    break
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            _LOGGER.exception("Error in socket listener")
+        finally:
+            self._connected = False
+            _LOGGER.debug("Socket listener ended")
+
+    async def _handle_message(self, raw: str) -> None:
+        """Parse and handle an incoming Socket.IO v2 message."""
+        if not raw:
+            return
+
+        # Engine.IO level
+        eio_type = raw[0]
+
+        if eio_type == EIO_PING:
+            # Server sent ping, respond with pong
+            await self._ws.send_str(EIO_PONG)
+            return
+
+        if eio_type == EIO_PONG:
+            return
+
+        if eio_type == EIO_CLOSE:
+            _LOGGER.debug("Received EIO close")
+            self._connected = False
+            return
+
+        if eio_type != EIO_MESSAGE:
+            _LOGGER.debug("Unhandled EIO packet type: %s", eio_type)
+            return
+
+        # Socket.IO level - strip EIO_MESSAGE prefix
+        sio_data = raw[1:]
+        if not sio_data:
+            return
+
+        sio_type = sio_data[0]
+        sio_payload = sio_data[1:]
+
+        if sio_type == SIO_CONNECT:
+            # Namespace connected
+            ns = sio_payload.rstrip(",") if sio_payload else "/"
+            self._connected_namespaces.add(ns)
+            _LOGGER.debug("Connected to namespace: %s", ns)
+            await self._emit_handlers("connect", ns, None)
+            return
+
+        if sio_type == SIO_DISCONNECT:
+            ns = sio_payload or "/"
+            self._connected_namespaces.discard(ns)
+            _LOGGER.debug("Disconnected from namespace: %s", ns)
+            await self._emit_handlers("disconnect", ns, None)
+            return
+
+        if sio_type == SIO_ERROR:
+            _LOGGER.error("Socket.IO error: %s", sio_payload)
+            return
+
+        if sio_type == SIO_EVENT:
+            await self._handle_event(sio_payload)
+            return
+
+        _LOGGER.debug("Unhandled SIO packet type: %s, data: %s", sio_type, sio_payload)
+
+    async def _handle_event(self, payload: str) -> None:
+        """Handle a Socket.IO event packet."""
+        # Parse namespace from payload: "/namespace,{ack_id}[data]"
+        namespace = "/"
+        data_str = payload
+
+        if payload.startswith("/"):
+            # Has namespace prefix
+            comma_idx = payload.index(",")
+            namespace = payload[:comma_idx]
+            data_str = payload[comma_idx + 1:]
+
+        # Strip optional ack ID (digits before the JSON array)
+        idx = 0
+        while idx < len(data_str) and data_str[idx].isdigit():
+            idx += 1
+        data_str = data_str[idx:]
+
+        try:
+            event_data = json.loads(data_str)
+        except json.JSONDecodeError:
+            _LOGGER.debug(
+                "Failed to parse event data: %s (ns=%s)", data_str, namespace
+            )
+            return
+
+        if isinstance(event_data, list) and len(event_data) >= 1:
+            event_name = event_data[0]
+            event_args = event_data[1] if len(event_data) > 1 else None
+            _LOGGER.debug(
+                "Event on %s: %s -> %s", namespace, event_name, event_args
+            )
+            await self._emit_handlers(event_name, namespace, event_args)
+        else:
+            _LOGGER.debug("Unexpected event format: %s", event_data)
+
+    async def _emit_handlers(
+        self, event: str, namespace: str, data: Any
+    ) -> None:
+        """Call registered handlers for an event."""
+        ns_handlers = self._event_handlers.get(namespace, {})
+        handlers = ns_handlers.get(event, []) + ns_handlers.get("*", [])
+        for handler in handlers:
+            try:
+                result = handler(event, data) if event == "*" or event not in ns_handlers else handler(data)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                _LOGGER.exception(
+                    "Error in handler for event %s on %s", event, namespace
+                )
+
+    async def emit(
+        self, event: str, data: Any, namespace: str = "/"
+    ) -> None:
+        """Send an event to the server."""
+        if not self.connected:
+            raise DknConnectionError("Socket not connected")
+
+        payload = json.dumps([event, data])
+
+        if namespace and namespace != "/":
+            message = f"{EIO_MESSAGE}{SIO_EVENT}{namespace},{payload}"
+        else:
+            message = f"{EIO_MESSAGE}{SIO_EVENT}{payload}"
+
+        _LOGGER.debug("Sending: %s", message)
+        await self._ws.send_str(message)
+
+    async def _ping_loop(self) -> None:
+        """Send periodic pings to keep connection alive."""
+        try:
+            while self._connected:
+                await asyncio.sleep(self._ping_interval)
+                if self._ws and not self._ws.closed:
+                    await self._ws.send_str(EIO_PING)
+                    _LOGGER.debug("Sent EIO ping")
+                else:
+                    break
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            _LOGGER.exception("Error in ping loop")
+
+    async def disconnect(self) -> None:
+        """Disconnect the websocket."""
+        self._connected = False
+        if self._ping_task:
+            self._ping_task.cancel()
+        if self._listener_task:
+            self._listener_task.cancel()
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+
+
 class DknCloudApi:
     """Client for the DKN Cloud NA API."""
 
@@ -52,7 +347,7 @@ class DknCloudApi:
         self._base_url = API_BASE_URL
         self._api_url = f"{API_BASE_URL}{API_BASE_PATH}"
         self._session: aiohttp.ClientSession | None = None
-        self._sio_clients: dict[str, socketio.AsyncClient] = {}
+        self._sio_connections: dict[str, SocketIOv2Connection] = {}
         self._installations: list[dict[str, Any]] = []
         self._devices: dict[str, dict[str, Any]] = {}
         self._device_callbacks: list[Callable] = []
@@ -118,7 +413,9 @@ class DknCloudApi:
                 if resp.status == 200:
                     data = await resp.json()
                     self.token = data.get("token")
-                    self.refresh_token = data.get("refreshToken", self.refresh_token)
+                    self.refresh_token = data.get(
+                        "refreshToken", self.refresh_token
+                    )
                     _LOGGER.debug("Token refreshed successfully")
                     return True
                 return False
@@ -143,7 +440,9 @@ class DknCloudApi:
                 _LOGGER.error("Login failed with status %s", resp.status)
                 raise DknAuthError(f"Login failed with status {resp.status}")
         except aiohttp.ClientError as err:
-            raise DknConnectionError(f"Connection error during login: {err}") from err
+            raise DknConnectionError(
+                f"Connection error during login: {err}"
+            ) from err
 
     async def get_installations(self) -> list[dict[str, Any]]:
         """Fetch all installations and their devices."""
@@ -181,6 +480,7 @@ class DknCloudApi:
                         "mac": mac,
                         "name": device.get("name", f"DKN {mac}"),
                         "icon": device.get("icon", ""),
+                        "units": install.get("units", 0),
                         "data": device,
                     }
                     _LOGGER.debug(
@@ -189,171 +489,76 @@ class DknCloudApi:
                         mac,
                         list(device.keys()),
                     )
-                    _LOGGER.debug(
-                        "Device %s full data: %s", mac, device
-                    )
 
     async def connect_socket(self) -> None:
         """Establish socket.io connections for real-time updates."""
         if not self.token:
             raise DknAuthError("Must authenticate before connecting socket")
 
-        await self._connect_users_namespace()
+        session = await self._ensure_session()
 
+        # Connect to /users namespace
+        users_conn = SocketIOv2Connection(
+            self._base_url, API_SOCKET_PATH, self.token, session
+        )
+        users_conn.on("connect", "/users", self._on_users_connect)
+        users_conn.on("disconnect", "/users", self._on_users_disconnect)
+        try:
+            await users_conn.connect(["/users"])
+            self._sio_connections["users"] = users_conn
+            _LOGGER.debug("Connected to /users namespace")
+        except DknConnectionError:
+            _LOGGER.error("Failed to connect to /users namespace")
+            raise
+
+        # Connect to each installation namespace
         for install in self._installations:
             install_id = install["_id"]
-            await self._connect_installation_namespace(install_id)
+            namespace = f"/{install_id}::dknUsa"
+
+            conn = SocketIOv2Connection(
+                self._base_url, API_SOCKET_PATH, self.token, session
+            )
+            conn.on(EVENT_DEVICE_DATA, namespace, self._on_device_data)
+            conn.on("connect", namespace, self._on_install_connect)
+            conn.on("disconnect", namespace, self._on_install_disconnect)
+            try:
+                await conn.connect([namespace])
+                self._sio_connections[install_id] = conn
+                _LOGGER.debug("Connected to namespace %s", namespace)
+            except DknConnectionError:
+                _LOGGER.error("Failed to connect to namespace %s", namespace)
+                raise
 
         self._connected = True
-        _LOGGER.debug("Socket.io connections established")
+        _LOGGER.info("All socket.io connections established")
 
-    def _create_sio_client(self) -> socketio.AsyncClient:
-        """Create a socket.io client with appropriate settings."""
-        return socketio.AsyncClient(
-            reconnection=True,
-            reconnection_attempts=5,
-            reconnection_delay=1,
-            reconnection_delay_max=5,
-            logger=_LOGGER.isEnabledFor(logging.DEBUG),
-            engineio_logger=_LOGGER.isEnabledFor(logging.DEBUG),
-        )
+    def _on_users_connect(self, data: Any) -> None:
+        _LOGGER.debug("Users namespace connected")
 
-    async def _sio_connect(
-        self, sio: socketio.AsyncClient, namespaces: list[str]
-    ) -> None:
-        """Connect a socket.io client, trying websocket first then polling."""
-        connect_kwargs = {
-            "socketio_path": API_SOCKET_PATH,
-            "namespaces": namespaces,
-            "headers": {
-                "Authorization": f"Bearer {self.token}",
-                "User-Agent": USER_AGENT,
-            },
-            "auth": {"token": self.token},
-        }
+    def _on_users_disconnect(self, data: Any) -> None:
+        _LOGGER.warning("Users namespace disconnected")
 
-        # Try websocket first, then fall back to polling
-        for transports in [["websocket"], ["polling", "websocket"]]:
-            try:
-                await sio.connect(
-                    self._base_url,
-                    transports=transports,
-                    **connect_kwargs,
-                )
-                _LOGGER.debug(
-                    "Socket.io connected with transports=%s", transports
-                )
-                return
-            except Exception as err:
-                _LOGGER.debug(
-                    "Socket.io connect with transports=%s failed: %s",
-                    transports,
-                    err,
-                )
+    def _on_install_connect(self, data: Any) -> None:
+        _LOGGER.debug("Installation namespace connected")
 
-        raise DknConnectionError("All socket.io transport methods failed")
+    def _on_install_disconnect(self, data: Any) -> None:
+        _LOGGER.warning("Installation namespace disconnected")
 
-    async def _connect_users_namespace(self) -> None:
-        """Connect to the /users namespace."""
-        sio = self._create_sio_client()
+    def _on_device_data(self, data: Any) -> None:
+        """Handle incoming device data from socket.io."""
+        if not isinstance(data, dict):
+            _LOGGER.debug("Unexpected device-data format: %s", data)
+            return
 
-        @sio.on(EVENT_CONTROL_NEW_DEVICE, namespace="/users")
-        async def on_new_device(data: dict) -> None:
-            _LOGGER.info("New device detected: %s", data)
-            await self.get_installations()
-            self._notify_device_update()
-
-        @sio.on(EVENT_CONTROL_DELETED_DEVICE, namespace="/users")
-        async def on_deleted_device(data: dict) -> None:
-            _LOGGER.info("Device removed: %s", data)
-            mac = data.get("mac")
-            if mac and mac in self._devices:
-                del self._devices[mac]
-            self._notify_device_update()
-
-        @sio.on(EVENT_CONTROL_DELETED_INSTALLATION, namespace="/users")
-        async def on_deleted_installation(data: dict) -> None:
-            _LOGGER.info("Installation removed: %s", data)
-
-        @sio.on("connect", namespace="/users")
-        async def on_connect() -> None:
-            _LOGGER.debug("Connected to /users namespace")
-
-        @sio.on("connect_error", namespace="/users")
-        async def on_connect_error(data: Any) -> None:
-            _LOGGER.error("Socket.io /users connect error: %s", data)
-
-        @sio.on("disconnect", namespace="/users")
-        async def on_disconnect() -> None:
-            _LOGGER.debug("Disconnected from /users namespace")
-
-        # Catch-all for debugging unknown events
-        @sio.on("*", namespace="/users")
-        async def on_any(event: str, data: Any) -> None:
-            _LOGGER.debug("Socket.io /users event '%s': %s", event, data)
-
-        try:
-            await self._sio_connect(sio, ["/users"])
-            self._sio_clients["users"] = sio
-        except DknConnectionError:
-            raise
-        except Exception as err:
-            _LOGGER.error("Failed to connect to /users namespace: %s", err)
-            raise DknConnectionError(
-                f"Socket.io connection failed: {err}"
-            ) from err
-
-    async def _connect_installation_namespace(
-        self, installation_id: str
-    ) -> None:
-        """Connect to an installation namespace for device data."""
-        namespace = f"/{installation_id}::dknUsa"
-        sio = self._create_sio_client()
-
-        @sio.on(EVENT_DEVICE_DATA, namespace=namespace)
-        async def on_device_data(data: dict) -> None:
-            _LOGGER.debug(
-                "Raw device-data event on %s: %s", namespace, data
-            )
-            mac = data.get("mac")
-            if mac and mac in self._devices:
-                device = self._devices[mac]
-                device["data"].update(data)
-                self._notify_device_update(mac)
-
-        @sio.on("connect", namespace=namespace)
-        async def on_connect() -> None:
-            _LOGGER.debug("Connected to namespace %s", namespace)
-
-        @sio.on("connect_error", namespace=namespace)
-        async def on_connect_error(data: Any) -> None:
-            _LOGGER.error(
-                "Socket.io %s connect error: %s", namespace, data
-            )
-
-        @sio.on("disconnect", namespace=namespace)
-        async def on_disconnect() -> None:
-            _LOGGER.debug("Disconnected from namespace %s", namespace)
-
-        # Catch-all for debugging unknown events
-        @sio.on("*", namespace=namespace)
-        async def on_any(event: str, data: Any) -> None:
-            _LOGGER.debug(
-                "Socket.io %s event '%s': %s", namespace, event, data
-            )
-
-        try:
-            await self._sio_connect(sio, [namespace])
-            self._sio_clients[installation_id] = sio
-        except DknConnectionError:
-            raise
-        except Exception as err:
-            _LOGGER.error(
-                "Failed to connect to namespace %s: %s", namespace, err
-            )
-            raise DknConnectionError(
-                f"Socket.io connection to {namespace} failed: {err}"
-            ) from err
+        mac = data.get("mac")
+        if mac and mac in self._devices:
+            device = self._devices[mac]
+            device["data"].update(data)
+            _LOGGER.debug("Device data update for %s: %s", mac, data)
+            self._notify_device_update(mac)
+        else:
+            _LOGGER.debug("Device data for unknown mac %s: %s", mac, data)
 
     async def send_command(
         self, mac: str, prop: str, value: Any
@@ -364,17 +569,22 @@ class DknCloudApi:
             raise DknCloudApiError(f"Unknown device: {mac}")
 
         installation_id = device["installation_id"]
-        sio = self._sio_clients.get(installation_id)
-        if not sio or not sio.connected:
+        conn = self._sio_connections.get(installation_id)
+
+        if not conn or not conn.connected:
             _LOGGER.warning(
                 "Socket not connected for installation %s, reconnecting",
                 installation_id,
             )
-            await self._connect_installation_namespace(installation_id)
-            sio = self._sio_clients.get(installation_id)
+            await self._reconnect_installation(installation_id)
+            conn = self._sio_connections.get(installation_id)
+            if not conn or not conn.connected:
+                raise DknConnectionError(
+                    f"Cannot connect to installation {installation_id}"
+                )
 
         namespace = f"/{installation_id}::dknUsa"
-        await sio.emit(
+        await conn.emit(
             EVENT_CREATE_MACHINE_EVENT,
             {"mac": mac, "property": prop, "value": value},
             namespace=namespace,
@@ -385,31 +595,49 @@ class DknCloudApi:
         device["data"][prop] = value
         self._notify_device_update(mac)
 
+    async def _reconnect_installation(self, installation_id: str) -> None:
+        """Reconnect to an installation namespace."""
+        old_conn = self._sio_connections.pop(installation_id, None)
+        if old_conn:
+            await old_conn.disconnect()
+
+        session = await self._ensure_session()
+        namespace = f"/{installation_id}::dknUsa"
+        conn = SocketIOv2Connection(
+            self._base_url, API_SOCKET_PATH, self.token, session
+        )
+        conn.on(EVENT_DEVICE_DATA, namespace, self._on_device_data)
+        conn.on("connect", namespace, self._on_install_connect)
+        conn.on("disconnect", namespace, self._on_install_disconnect)
+        await conn.connect([namespace])
+        self._sio_connections[installation_id] = conn
+
     def register_device_callback(self, callback: Callable) -> Callable:
         """Register a callback for device updates. Returns unregister function."""
         self._device_callbacks.append(callback)
 
         def unregister() -> None:
-            self._device_callbacks.remove(callback)
+            if callback in self._device_callbacks:
+                self._device_callbacks.remove(callback)
 
         return unregister
 
     def _notify_device_update(self, mac: str | None = None) -> None:
         """Notify all registered callbacks of device updates."""
-        for callback in self._device_callbacks:
+        for cb in self._device_callbacks:
             try:
-                callback(mac)
+                cb(mac)
             except Exception:
                 _LOGGER.exception("Error in device update callback")
 
     async def disconnect(self) -> None:
-        """Disconnect all socket.io clients and close session."""
-        for key, sio in self._sio_clients.items():
+        """Disconnect all connections and close session."""
+        for key, conn in self._sio_connections.items():
             try:
-                await sio.disconnect()
+                await conn.disconnect()
             except Exception:
                 _LOGGER.debug("Error disconnecting socket %s", key)
-        self._sio_clients.clear()
+        self._sio_connections.clear()
         self._connected = False
 
         if self._session and not self._session.closed:
