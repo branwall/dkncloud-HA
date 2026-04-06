@@ -158,6 +158,12 @@ class DknClimateEntity(ClimateEntity):
     def current_temperature(self) -> float | None:
         """Return the current temperature."""
         temp = self._data.get(PROP_WORK_TEMP)
+        _LOGGER.debug(
+            "Device %s current_temperature: work_temp=%s, all keys=%s",
+            self._mac,
+            temp,
+            list(self._data.keys()),
+        )
         if temp is not None:
             return self._to_celsius(temp)
         return None
@@ -168,6 +174,13 @@ class DknClimateEntity(ClimateEntity):
         mode = self._data.get(PROP_MODE)
         prop = SETPOINT_PROP_MAP.get(mode, PROP_SETPOINT_AUTO)
         temp = self._data.get(prop)
+        _LOGGER.debug(
+            "Device %s target_temperature: mode=%s, prop=%s, temp=%s",
+            self._mac,
+            mode,
+            prop,
+            temp,
+        )
         if temp is not None:
             return self._to_celsius(temp)
         return None

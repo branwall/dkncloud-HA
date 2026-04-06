@@ -155,6 +155,9 @@ class DknCloudApi:
             ) as resp:
                 if resp.status == 200:
                     self._installations = await resp.json()
+                    _LOGGER.debug(
+                        "Raw installations response: %s", self._installations
+                    )
                     self._process_installations()
                     return self._installations
                 if resp.status == 401:
@@ -180,6 +183,15 @@ class DknCloudApi:
                         "icon": device.get("icon", ""),
                         "data": device,
                     }
+                    _LOGGER.debug(
+                        "Device %s (%s) data keys: %s",
+                        device.get("name"),
+                        mac,
+                        list(device.keys()),
+                    )
+                    _LOGGER.debug(
+                        "Device %s full data: %s", mac, device
+                    )
 
     async def connect_socket(self) -> None:
         """Establish socket.io connections for real-time updates."""
@@ -195,14 +207,55 @@ class DknCloudApi:
         self._connected = True
         _LOGGER.debug("Socket.io connections established")
 
-    async def _connect_users_namespace(self) -> None:
-        """Connect to the /users namespace."""
-        sio = socketio.AsyncClient(
+    def _create_sio_client(self) -> socketio.AsyncClient:
+        """Create a socket.io client with appropriate settings."""
+        return socketio.AsyncClient(
             reconnection=True,
             reconnection_attempts=5,
             reconnection_delay=1,
             reconnection_delay_max=5,
+            logger=_LOGGER.isEnabledFor(logging.DEBUG),
+            engineio_logger=_LOGGER.isEnabledFor(logging.DEBUG),
         )
+
+    async def _sio_connect(
+        self, sio: socketio.AsyncClient, namespaces: list[str]
+    ) -> None:
+        """Connect a socket.io client, trying websocket first then polling."""
+        connect_kwargs = {
+            "socketio_path": API_SOCKET_PATH,
+            "namespaces": namespaces,
+            "headers": {
+                "Authorization": f"Bearer {self.token}",
+                "User-Agent": USER_AGENT,
+            },
+            "auth": {"token": self.token},
+        }
+
+        # Try websocket first, then fall back to polling
+        for transports in [["websocket"], ["polling", "websocket"]]:
+            try:
+                await sio.connect(
+                    self._base_url,
+                    transports=transports,
+                    **connect_kwargs,
+                )
+                _LOGGER.debug(
+                    "Socket.io connected with transports=%s", transports
+                )
+                return
+            except Exception as err:
+                _LOGGER.debug(
+                    "Socket.io connect with transports=%s failed: %s",
+                    transports,
+                    err,
+                )
+
+        raise DknConnectionError("All socket.io transport methods failed")
+
+    async def _connect_users_namespace(self) -> None:
+        """Connect to the /users namespace."""
+        sio = self._create_sio_client()
 
         @sio.on(EVENT_CONTROL_NEW_DEVICE, namespace="/users")
         async def on_new_device(data: dict) -> None:
@@ -226,19 +279,24 @@ class DknCloudApi:
         async def on_connect() -> None:
             _LOGGER.debug("Connected to /users namespace")
 
+        @sio.on("connect_error", namespace="/users")
+        async def on_connect_error(data: Any) -> None:
+            _LOGGER.error("Socket.io /users connect error: %s", data)
+
         @sio.on("disconnect", namespace="/users")
         async def on_disconnect() -> None:
             _LOGGER.debug("Disconnected from /users namespace")
 
+        # Catch-all for debugging unknown events
+        @sio.on("*", namespace="/users")
+        async def on_any(event: str, data: Any) -> None:
+            _LOGGER.debug("Socket.io /users event '%s': %s", event, data)
+
         try:
-            await sio.connect(
-                self._base_url,
-                socketio_path=API_SOCKET_PATH,
-                namespaces=["/users"],
-                headers={"Authorization": f"Bearer {self.token}"},
-                transports=["websocket"],
-            )
+            await self._sio_connect(sio, ["/users"])
             self._sio_clients["users"] = sio
+        except DknConnectionError:
+            raise
         except Exception as err:
             _LOGGER.error("Failed to connect to /users namespace: %s", err)
             raise DknConnectionError(
@@ -250,40 +308,45 @@ class DknCloudApi:
     ) -> None:
         """Connect to an installation namespace for device data."""
         namespace = f"/{installation_id}::dknUsa"
-
-        sio = socketio.AsyncClient(
-            reconnection=True,
-            reconnection_attempts=5,
-            reconnection_delay=1,
-            reconnection_delay_max=5,
-        )
+        sio = self._create_sio_client()
 
         @sio.on(EVENT_DEVICE_DATA, namespace=namespace)
         async def on_device_data(data: dict) -> None:
+            _LOGGER.debug(
+                "Raw device-data event on %s: %s", namespace, data
+            )
             mac = data.get("mac")
             if mac and mac in self._devices:
                 device = self._devices[mac]
                 device["data"].update(data)
-                _LOGGER.debug("Device data update for %s: %s", mac, data)
                 self._notify_device_update(mac)
 
         @sio.on("connect", namespace=namespace)
         async def on_connect() -> None:
             _LOGGER.debug("Connected to namespace %s", namespace)
 
+        @sio.on("connect_error", namespace=namespace)
+        async def on_connect_error(data: Any) -> None:
+            _LOGGER.error(
+                "Socket.io %s connect error: %s", namespace, data
+            )
+
         @sio.on("disconnect", namespace=namespace)
         async def on_disconnect() -> None:
             _LOGGER.debug("Disconnected from namespace %s", namespace)
 
-        try:
-            await sio.connect(
-                self._base_url,
-                socketio_path=API_SOCKET_PATH,
-                namespaces=[namespace],
-                headers={"Authorization": f"Bearer {self.token}"},
-                transports=["websocket"],
+        # Catch-all for debugging unknown events
+        @sio.on("*", namespace=namespace)
+        async def on_any(event: str, data: Any) -> None:
+            _LOGGER.debug(
+                "Socket.io %s event '%s': %s", namespace, event, data
             )
+
+        try:
+            await self._sio_connect(sio, [namespace])
             self._sio_clients[installation_id] = sio
+        except DknConnectionError:
+            raise
         except Exception as err:
             _LOGGER.error(
                 "Failed to connect to namespace %s: %s", namespace, err
