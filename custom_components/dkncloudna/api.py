@@ -96,56 +96,105 @@ class SocketIOv2Connection:
         self._event_handlers[namespace][event].append(handler)
 
     async def connect(self, namespaces: list[str]) -> None:
-        """Establish the websocket connection and join namespaces."""
-        self._namespaces = namespaces
+        """Establish the websocket connection and join namespaces.
 
-        # Build the websocket URL with EIO=3 for Socket.IO v2
+        Socket.IO v2 / Engine.IO v3 requires a polling handshake first
+        to obtain a session ID (sid), then upgrades to websocket.
+        """
+        self._namespaces = namespaces
+        auth_headers = {
+            "Authorization": f"Bearer {self._token}",
+            "User-Agent": USER_AGENT,
+        }
+        socket_base = (
+            f"{self._base_url}/{self._socket_path.strip('/')}/"
+        )
+
+        # Step 1: Polling handshake to get session ID
+        poll_url = f"{socket_base}?EIO=3&transport=polling"
+        _LOGGER.debug("Socket.IO polling handshake: %s", poll_url)
+
+        try:
+            async with self._session.get(
+                poll_url, headers=auth_headers
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    _LOGGER.error(
+                        "Polling handshake failed: status=%s body=%s",
+                        resp.status,
+                        body[:500],
+                    )
+                    raise DknConnectionError(
+                        f"Polling handshake failed: {resp.status}"
+                    )
+                raw = await resp.text()
+                _LOGGER.debug("Polling handshake response: %s", raw[:500])
+        except aiohttp.ClientError as err:
+            raise DknConnectionError(
+                f"Polling handshake connection error: {err}"
+            ) from err
+
+        # Parse the Engine.IO open packet from polling response.
+        # Polling responses may be length-prefixed or plain JSON.
+        # Format can be: "97:0{...}" or just "0{...}"
+        open_json = self._extract_eio_open(raw)
+        if not open_json:
+            raise DknConnectionError(
+                f"Could not parse EIO open from: {raw[:200]}"
+            )
+
+        open_data = json.loads(open_json)
+        sid = open_data.get("sid")
+        self._ping_interval = open_data.get("pingInterval", 25000) / 1000
+        self._ping_timeout = open_data.get("pingTimeout", 60000) / 1000
+        upgrades = open_data.get("upgrades", [])
+        _LOGGER.debug(
+            "EIO open: sid=%s, pingInterval=%.1fs, pingTimeout=%.1fs, "
+            "upgrades=%s",
+            sid,
+            self._ping_interval,
+            self._ping_timeout,
+            upgrades,
+        )
+
+        if not sid:
+            raise DknConnectionError("No session ID in EIO open packet")
+
+        # Step 2: Upgrade to websocket with the session ID
         ws_url = (
             f"{self._base_url.replace('https://', 'wss://').replace('http://', 'ws://')}"
             f"/{self._socket_path.strip('/')}/"
-            f"?transport=websocket&EIO=3"
+            f"?EIO=3&transport=websocket&sid={sid}"
         )
-
-        _LOGGER.debug("Connecting to Socket.IO v2: %s", ws_url)
+        _LOGGER.debug("Upgrading to WebSocket: %s", ws_url)
 
         try:
             self._ws = await self._session.ws_connect(
-                ws_url,
-                headers={
-                    "Authorization": f"Bearer {self._token}",
-                    "User-Agent": USER_AGENT,
-                },
+                ws_url, headers=auth_headers
             )
         except Exception as err:
-            _LOGGER.error("WebSocket connection failed: %s", err)
+            _LOGGER.error("WebSocket upgrade failed: %s", err)
             raise DknConnectionError(
-                f"WebSocket connection failed: {err}"
+                f"WebSocket upgrade failed: {err}"
             ) from err
 
-        # Read the EIO open packet to get ping interval
+        # Step 3: Send the upgrade probe
+        await self._ws.send_str(f"{EIO_PING}probe")
         msg = await self._ws.receive(timeout=10)
-        if msg.type == aiohttp.WSMsgType.TEXT and msg.data.startswith(EIO_OPEN):
-            open_data = json.loads(msg.data[1:])
-            self._ping_interval = open_data.get("pingInterval", 25000) / 1000
-            self._ping_timeout = open_data.get("pingTimeout", 60000) / 1000
-            _LOGGER.debug(
-                "EIO open: pingInterval=%.1fs, pingTimeout=%.1fs, sid=%s",
-                self._ping_interval,
-                self._ping_timeout,
-                open_data.get("sid"),
-            )
+        if (
+            msg.type == aiohttp.WSMsgType.TEXT
+            and msg.data == f"{EIO_PONG}probe"
+        ):
+            _LOGGER.debug("WebSocket upgrade probe successful")
         else:
-            _LOGGER.error("Unexpected first message: %s", msg)
-            await self._ws.close()
-            raise DknConnectionError("Did not receive EIO open packet")
+            _LOGGER.debug("Upgrade probe response: %s", msg)
 
-        # The default namespace "/" is auto-connected.
-        # Read the SIO connect for "/" namespace
-        msg = await self._ws.receive(timeout=10)
-        if msg.type == aiohttp.WSMsgType.TEXT:
-            _LOGGER.debug("Default namespace connect message: %s", msg.data)
-            self._connected_namespaces.add("/")
+        # Send upgrade completion (EIO upgrade packet = "5")
+        await self._ws.send_str("5")
 
+        # The default namespace "/" is now connected
+        self._connected_namespaces.add("/")
         self._connected = True
 
         # Connect to additional namespaces
@@ -159,6 +208,30 @@ class SocketIOv2Connection:
         # Start background tasks
         self._listener_task = asyncio.create_task(self._listen())
         self._ping_task = asyncio.create_task(self._ping_loop())
+
+    @staticmethod
+    def _extract_eio_open(raw: str) -> str | None:
+        """Extract the JSON payload from an Engine.IO open packet.
+
+        Polling responses can be in various formats:
+        - Plain: '0{"sid":"abc",...}'
+        - Length-prefixed: '97:0{"sid":"abc",...}'
+        - XHR2 binary framing with \\x00 and \\xff delimiters
+        """
+        # Try to find '0{' which marks the open packet
+        idx = raw.find("0{")
+        if idx >= 0:
+            json_str = raw[idx + 1:]
+            # Find matching closing brace
+            depth = 0
+            for i, ch in enumerate(json_str):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return json_str[: i + 1]
+        return None
 
     async def _listen(self) -> None:
         """Listen for incoming messages."""
