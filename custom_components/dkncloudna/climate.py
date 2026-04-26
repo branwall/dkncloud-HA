@@ -134,7 +134,7 @@ class DknClimateEntity(ClimateEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return self._mac in self._api.devices
+        return self._mac in self._api.devices and self._api.is_socket_healthy
 
     @property
     def hvac_mode(self) -> HVACMode:

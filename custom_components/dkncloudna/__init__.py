@@ -7,8 +7,9 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
-from .api import DknCloudApi
+from .api import DknAuthError, DknCloudApi, DknConnectionError
 from .const import CONF_EMAIL, CONF_PASSWORD, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -23,15 +24,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         password=entry.data[CONF_PASSWORD],
     )
 
-    await api.authenticate()
-    await api.get_installations()
-
     try:
+        await api.authenticate()
+        await api.get_installations()
         await api.connect_socket()
-    except Exception:
-        _LOGGER.warning(
-            "Socket.io connection failed; will rely on polling for updates"
-        )
+    except DknAuthError as err:
+        await api.disconnect()
+        _LOGGER.error("DKN Cloud NA authentication failed: %s", err)
+        raise ConfigEntryAuthFailed(str(err)) from err
+    except DknConnectionError as err:
+        await api.disconnect()
+        _LOGGER.warning("DKN Cloud NA not reachable, will retry: %s", err)
+        raise ConfigEntryNotReady(str(err)) from err
+
+    api.start_supervisor()
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = api
