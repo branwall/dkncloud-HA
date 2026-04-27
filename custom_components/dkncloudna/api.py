@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Callable
 
 import aiohttp
@@ -81,6 +82,10 @@ class SocketIOv2Connection:
         self._ping_task: asyncio.Task | None = None
         self._connected = False
         self._ack_id = 0
+        self._last_message_at: float = 0.0
+        # Treat the connection as stale if no inbound traffic arrives for
+        # this many seconds. Set after handshake based on server ping_interval.
+        self._stale_after: float = 75.0
 
     @property
     def connected(self) -> bool:
@@ -93,6 +98,17 @@ class SocketIOv2Connection:
         if not self.connected:
             return False
         return all(ns in self._connected_namespaces for ns in self._namespaces)
+
+    @property
+    def is_stale(self) -> bool:
+        """Return True if no inbound traffic has arrived recently.
+
+        Detects silently dead TCP connections (NAT timeouts, idle proxy
+        resets) where the websocket appears open but no data is flowing.
+        """
+        if self._last_message_at == 0.0:
+            return False
+        return (time.monotonic() - self._last_message_at) > self._stale_after
 
     def on(self, event: str, namespace: str, handler: Callable) -> None:
         """Register an event handler for a namespace."""
@@ -203,6 +219,8 @@ class SocketIOv2Connection:
         # The default namespace "/" is now connected
         self._connected_namespaces.add("/")
         self._connected = True
+        self._last_message_at = time.monotonic()
+        self._stale_after = max(self._ping_interval * 3, 60.0)
 
         # Connect to additional namespaces
         for ns in namespaces:
@@ -245,6 +263,7 @@ class SocketIOv2Connection:
         try:
             async for msg in self._ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    self._last_message_at = time.monotonic()
                     await self._handle_message(msg.data)
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     _LOGGER.error("WebSocket error: %s", self._ws.exception())
@@ -450,13 +469,22 @@ class DknCloudApi:
 
     @property
     def is_socket_healthy(self) -> bool:
-        """Return True if every expected socket namespace is currently connected."""
+        """Return True if every expected socket namespace is connected and not stale."""
         if not self._sio_connections:
             return False
         expected = 1 + len(self._installations)
         if len(self._sio_connections) < expected:
             return False
-        return all(conn.fully_connected for conn in self._sio_connections.values())
+        for conn in self._sio_connections.values():
+            if not conn.fully_connected:
+                return False
+            if conn.is_stale:
+                _LOGGER.warning(
+                    "Socket appears stale (no inbound traffic recently); "
+                    "marking unhealthy"
+                )
+                return False
+        return True
 
     def _headers(self, with_auth: bool = True) -> dict[str, str]:
         """Build request headers."""
