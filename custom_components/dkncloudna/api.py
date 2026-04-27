@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Callable
 
 import aiohttp
@@ -81,11 +82,33 @@ class SocketIOv2Connection:
         self._ping_task: asyncio.Task | None = None
         self._connected = False
         self._ack_id = 0
+        self._last_message_at: float = 0.0
+        # Treat the connection as stale if no inbound traffic arrives for
+        # this many seconds. Set after handshake based on server ping_interval.
+        self._stale_after: float = 75.0
 
     @property
     def connected(self) -> bool:
         """Return whether the connection is active."""
         return self._connected and self._ws is not None and not self._ws.closed
+
+    @property
+    def fully_connected(self) -> bool:
+        """Return True only if the websocket is up and every requested namespace is joined."""
+        if not self.connected:
+            return False
+        return all(ns in self._connected_namespaces for ns in self._namespaces)
+
+    @property
+    def is_stale(self) -> bool:
+        """Return True if no inbound traffic has arrived recently.
+
+        Detects silently dead TCP connections (NAT timeouts, idle proxy
+        resets) where the websocket appears open but no data is flowing.
+        """
+        if self._last_message_at == 0.0:
+            return False
+        return (time.monotonic() - self._last_message_at) > self._stale_after
 
     def on(self, event: str, namespace: str, handler: Callable) -> None:
         """Register an event handler for a namespace."""
@@ -196,6 +219,8 @@ class SocketIOv2Connection:
         # The default namespace "/" is now connected
         self._connected_namespaces.add("/")
         self._connected = True
+        self._last_message_at = time.monotonic()
+        self._stale_after = max(self._ping_interval * 3, 60.0)
 
         # Connect to additional namespaces
         for ns in namespaces:
@@ -238,6 +263,7 @@ class SocketIOv2Connection:
         try:
             async for msg in self._ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    self._last_message_at = time.monotonic()
                     await self._handle_message(msg.data)
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     _LOGGER.error("WebSocket error: %s", self._ws.exception())
@@ -250,10 +276,12 @@ class SocketIOv2Connection:
         except asyncio.CancelledError:
             return
         except Exception:
-            _LOGGER.exception("Error in socket listener")
+            _LOGGER.exception(
+                "Socket listener crashed; supervisor will attempt reconnect"
+            )
         finally:
             self._connected = False
-            _LOGGER.debug("Socket listener ended")
+            _LOGGER.warning("Socket listener exited (namespaces=%s)", self._namespaces)
 
     async def _handle_message(self, raw: str) -> None:
         """Parse and handle an incoming Socket.IO v2 message."""
@@ -395,7 +423,10 @@ class SocketIOv2Connection:
         except asyncio.CancelledError:
             return
         except Exception:
-            _LOGGER.exception("Error in ping loop")
+            _LOGGER.exception(
+                "Ping loop crashed; supervisor will attempt reconnect"
+            )
+            self._connected = False
 
     async def disconnect(self) -> None:
         """Disconnect the websocket."""
@@ -425,11 +456,35 @@ class DknCloudApi:
         self._devices: dict[str, dict[str, Any]] = {}
         self._device_callbacks: list[Callable] = []
         self._connected = False
+        self._supervisor_task: asyncio.Task | None = None
+        self._shutdown = False
+        self._supervisor_check_interval = 30.0
+        self._supervisor_initial_backoff = 5.0
+        self._supervisor_max_backoff = 300.0
 
     @property
     def devices(self) -> dict[str, dict[str, Any]]:
         """Return discovered devices keyed by MAC address."""
         return self._devices
+
+    @property
+    def is_socket_healthy(self) -> bool:
+        """Return True if every expected socket namespace is connected and not stale."""
+        if not self._sio_connections:
+            return False
+        expected = 1 + len(self._installations)
+        if len(self._sio_connections) < expected:
+            return False
+        for conn in self._sio_connections.values():
+            if not conn.fully_connected:
+                return False
+            if conn.is_stale:
+                _LOGGER.warning(
+                    "Socket appears stale (no inbound traffic recently); "
+                    "marking unhealthy"
+                )
+                return False
+        return True
 
     def _headers(self, with_auth: bool = True) -> dict[str, str]:
         """Build request headers."""
@@ -611,12 +666,14 @@ class DknCloudApi:
 
     def _on_users_disconnect(self, data: Any) -> None:
         _LOGGER.warning("Users namespace disconnected")
+        self._notify_device_update(None)
 
     def _on_install_connect(self, data: Any) -> None:
         _LOGGER.debug("Installation namespace connected")
 
     def _on_install_disconnect(self, data: Any) -> None:
         _LOGGER.warning("Installation namespace disconnected")
+        self._notify_device_update(None)
 
     def _on_device_data(self, message: Any) -> None:
         """Handle incoming device data from socket.io.
@@ -688,6 +745,70 @@ class DknCloudApi:
         device["data"][prop] = value
         self._notify_device_update(mac)
 
+    def start_supervisor(self) -> None:
+        """Start the background supervisor that monitors and reconnects sockets."""
+        if self._shutdown:
+            return
+        if self._supervisor_task is None or self._supervisor_task.done():
+            self._supervisor_task = asyncio.create_task(self._supervisor())
+
+    async def _supervisor(self) -> None:
+        """Monitor socket health and reconnect with exponential backoff on failure."""
+        backoff = self._supervisor_initial_backoff
+        while not self._shutdown:
+            try:
+                await asyncio.sleep(self._supervisor_check_interval)
+                if self._shutdown:
+                    return
+                if self.is_socket_healthy:
+                    backoff = self._supervisor_initial_backoff
+                    continue
+
+                _LOGGER.warning(
+                    "DKN Cloud NA socket connection unhealthy; attempting reconnect"
+                )
+                self._notify_device_update(None)
+                try:
+                    await self._reconnect_all()
+                except DknAuthError as err:
+                    _LOGGER.error(
+                        "Reconnect failed (auth): %s; retrying in %.0fs",
+                        err,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, self._supervisor_max_backoff)
+                except DknConnectionError as err:
+                    _LOGGER.warning(
+                        "Reconnect failed (connection): %s; retrying in %.0fs",
+                        err,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, self._supervisor_max_backoff)
+                else:
+                    _LOGGER.info("DKN Cloud NA socket reconnect succeeded")
+                    backoff = self._supervisor_initial_backoff
+                    self._notify_device_update(None)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                _LOGGER.exception("Unexpected error in socket supervisor")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self._supervisor_max_backoff)
+
+    async def _reconnect_all(self) -> None:
+        """Tear down all socket connections and re-establish them."""
+        for key, conn in list(self._sio_connections.items()):
+            try:
+                await conn.disconnect()
+            except Exception:
+                _LOGGER.warning("Error tearing down socket %s during reconnect", key)
+        self._sio_connections.clear()
+        self._connected = False
+        await self.authenticate()
+        await self.connect_socket()
+
     async def _reconnect_installation(self, installation_id: str) -> None:
         """Reconnect to an installation namespace."""
         old_conn = self._sio_connections.pop(installation_id, None)
@@ -725,11 +846,28 @@ class DknCloudApi:
 
     async def disconnect(self) -> None:
         """Disconnect all connections and close session."""
+        self._shutdown = True
+        if self._supervisor_task and not self._supervisor_task.done():
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                _LOGGER.warning(
+                    "Supervisor task raised during shutdown", exc_info=True
+                )
+        self._supervisor_task = None
+
         for key, conn in self._sio_connections.items():
             try:
                 await conn.disconnect()
             except Exception:
-                _LOGGER.debug("Error disconnecting socket %s", key)
+                _LOGGER.warning(
+                    "Error disconnecting socket %s during shutdown",
+                    key,
+                    exc_info=True,
+                )
         self._sio_connections.clear()
         self._connected = False
 
